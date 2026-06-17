@@ -1,4 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
+import { genId, splitDataUrl, base64ToUint8, parseJsonLoose, alignConfidence } from './lib';
+import { RASHI_READING_GUIDE, DEFAULT_RASHI_FONT_URL, buildRashiReferenceChart } from './rashiReference';
 
 /* =====================================================================================
  *  NexusOCR — מנוע OCR מחקרי לספרות תורנית / כתב רש"י / דפוס ישן / סריקות מורכבות
@@ -105,35 +107,37 @@ const SCRIPT_TYPE_LABELS = {
   unknown: 'לא זוהה'
 };
 
-// הגדרות ברירת מחדל למנוע
+// הגדרות ברירת מחדל למנוע. עיבוד מקדים מתון כברירת מחדל — עיבוד אגרסיבי
+// (binarization/denoise חזק) פוגע בצורות העדינות של כתב רש"י ומוריד דיוק.
 const DEFAULT_SETTINGS = {
   ultraRashi: false,        // מצב Ultra Rashi — 10 מעברים, מקסימום דיוק
   regionOcr: false,         // OCR לפי אזורים (פירוק לבלוקים)
   forceScriptType: 'auto',  // 'auto' או כפיית סוג כתב
-  pdfScale: 3.0,            // רזולוציית חילוץ PDF (3.0 סטנדרט / מועלה ל-4.0 ב-Ultra)
-  ocrMaxWidth: 2048,        // רוחב מקסימלי לתמונה הנשלחת למודל (מועלה מ-1200!)
+  pdfScale: 3.0,            // רזולוציית חילוץ PDF
+  ocrMaxWidth: 2048,        // רוחב מקסימלי לתמונה הנשלחת למודל
+  rashiFontUrl: DEFAULT_RASHI_FONT_URL, // פונט רש"י לטבלת ייחוס ויזואלית (/rashi.ttf)
   preprocess: {
-    superResolution: true,  // הגדלת רזולוציה + חידוד
+    superResolution: true,  // הגדלת רזולוציה
     deskew: true,           // יישור דפים עקומים
-    contrast: true,         // שיפור ניגודיות
-    sharpen: true,          // חידוד טקסט
-    denoise: false,         // ניקוי רעשים (כבד — נדלק אוטומטית ב-Ultra)
-    adaptiveThreshold: true // הבלטת אותיות חלשות (לקריאה עצמאית נוספת)
+    contrast: true,         // שיפור ניגודיות מתון
+    sharpen: true,          // חידוד עדין
+    denoise: false,         // ניקוי רעשים (כבד; עלול לפגוע באותיות דקות — כבוי כברירת מחדל)
+    adaptiveThreshold: false // בינריזציה (עלולה לפגוע בכתב רש"י — כבוי כברירת מחדל)
   }
 };
 
-// חישוב תצורה אפקטיבית לפי המצב (Ultra Rashi דורס חלק מההגדרות)
+// חישוב תצורה אפקטיבית לפי המצב. Ultra מגביר מעברים ועיבוד מתון בלבד —
+// אינו כופה denoise/threshold כי הם עלולים לפגוע בדיוק בכתב רש"י.
 const effectiveSettings = (s) => {
   const eff = JSON.parse(JSON.stringify(s));
   if (s.ultraRashi) {
     eff.passCount = 10;
     eff.pdfScale = Math.max(s.pdfScale, 4.0);
-    eff.ocrMaxWidth = Math.max(s.ocrMaxWidth, 3000);
-    eff.preprocess.denoise = true;
+    eff.ocrMaxWidth = Math.max(s.ocrMaxWidth, 2400);
     eff.preprocess.superResolution = true;
     eff.preprocess.contrast = true;
     eff.preprocess.sharpen = true;
-    eff.preprocess.adaptiveThreshold = true;
+    eff.preprocess.deskew = true;
   } else {
     eff.passCount = 7;
   }
@@ -197,25 +201,6 @@ const loadImage = (src) => new Promise((resolve, reject) => {
   img.onerror = reject;
   img.src = src;
 });
-
-const splitDataUrl = (dataUrl) => {
-  const m = dataUrl.match(/^data:(image\/[a-zA-Z0-9-.+]+);base64,/);
-  return { mime: m ? m[1] : 'image/jpeg', data: dataUrl.split(',')[1] };
-};
-
-const base64ToUint8 = (b64) => {
-  const binary = atob(b64);
-  const len = binary.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-};
-
-// מזהה ייחודי עם fallback (crypto.randomUUID זמין רק ב-Secure Context)
-const genId = () => {
-  try { if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID(); } catch (e) {}
-  return 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
-};
 
 // תמונה ממוזערת קלה לסיידבר (חוסך פענוח תמונה מלאה בכל thumbnail)
 const makeThumbnail = async (base64, maxW = 140) => {
@@ -435,6 +420,9 @@ const preprocessImage = async (base64, settings) => {
     targetH = Math.round(img.height * factor);
   }
 
+  // וריאנט "מקור" קל (ללא עיבוד) לקריאה עצמאית שנייה — גיוון אמיתי מבלי לפגוע בצורות האות
+  const originalVariant = drawScaled(img, targetW, targetH).canvas.toDataURL('image/jpeg', 0.95);
+
   let { canvas } = drawScaled(img, targetW, targetH);
   await delay(0); // yield ל-UI
 
@@ -461,7 +449,7 @@ const preprocessImage = async (base64, settings) => {
   if (pp.contrast) {
     let loCut = 0, hiCut = 255;
     const total = (d.length / 4);
-    const clip = total * 0.005; // 0.5% percentile
+    const clip = total * 0.002; // 0.2% percentile — מתון יותר לשימור פרטים
     let acc = 0;
     for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc > clip) { loCut = v; break; } }
     acc = 0;
@@ -493,7 +481,7 @@ const preprocessImage = async (base64, settings) => {
 
   // Sharpen (unsharp mask)
   if (pp.sharpen) {
-    const kernel = [0, -0.6, 0, -0.6, 3.4, -0.6, 0, -0.6, 0];
+    const kernel = [0, -0.35, 0, -0.35, 2.4, -0.35, 0, -0.35, 0]; // חידוד עדין (פחות ringing על קווים דקים)
     const sharp = convolve3x3(d, w, h, kernel);
     imageData = new ImageData(sharp, w, h);
     d = imageData.data;
@@ -506,14 +494,16 @@ const preprocessImage = async (base64, settings) => {
   // JPEG איכותי — חיסכון משמעותי בזיכרון וב-payload לעומת PNG (לטקסט בגווני אפור)
   const enhanced = canvas.toDataURL('image/jpeg', 0.95);
 
-  // Adaptive Threshold על הגרייסקייל הנקי (לא על המערך המחודד) — וריאנט לקריאה עצמאית (Pass 2)
+  // Adaptive Threshold (אופציונלי) על הגרייסקייל הנקי — בינריזציה. כבוי כברירת מחדל כי
+  // הוא עלול לפגוע בכתב רש"י. הוריאנט השני לקריאה העצמאית הוא ה"מקור" הקל כברירת מחדל.
   let binarized = null;
   if (pp.adaptiveThreshold && grayClean) {
     binarized = adaptiveThreshold(grayClean, w, h);
     await delay(0);
   }
 
-  return { enhanced, binarized, width: w, height: h };
+  const secondary = binarized || originalVariant;
+  return { enhanced, secondary, width: w, height: h };
 };
 
 // Adaptive (local mean) threshold → מחזיר dataURL בינארי
@@ -591,12 +581,21 @@ const rateLimitGate = () => {
   return p;
 };
 
-// קריאה גנרית למודל עם throttle + backoff חכם. תומך בפלט טקסט או JSON (schema).
-const callGemini = async ({ system, userText, imageB64, schema, temperature = 0.0 }) => {
+const REQUEST_TIMEOUT_MS = 120000; // תקרת זמן לכל בקשה — מונע "תקיעה" אינסופית
+
+// קריאה גנרית למודל עם throttle + backoff חכם + timeout. תומך בפלט טקסט או JSON (schema).
+// refImageB64 (אופציונלי) — תמונת ייחוס (טבלת אותיות רש"י) הנשלחת לפני התמונה הראשית.
+const callGemini = async ({ system, userText, imageB64, refImageB64, schema, temperature = 0.0 }) => {
   const parts = [];
   if (userText) parts.push({ text: userText });
+  if (refImageB64) {
+    parts.push({ text: 'תמונת ייחוס (לזיהוי צורת אות בלבד): טבלת אותיות כתב רש"י מול אות דפוס.' });
+    const r = splitDataUrl(refImageB64);
+    parts.push({ inlineData: { mimeType: r.mime, data: r.data } });
+  }
   if (imageB64) {
     const { mime, data } = splitDataUrl(imageB64);
+    parts.push({ text: 'התמונה לפענוח:' });
     parts.push({ inlineData: { mimeType: mime, data } });
   }
 
@@ -619,12 +618,15 @@ const callGemini = async ({ system, userText, imageB64, schema, temperature = 0.
   const baseDelays = [1500, 3000, 6000, 12000];
   let lastError = null;
   for (let i = 0; i <= baseDelays.length; i++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
       await rateLimitGate();
       const response = await fetch(apiUrl(), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        signal: controller.signal
       });
 
       if (!response.ok) {
@@ -652,32 +654,19 @@ const callGemini = async ({ system, userText, imageB64, schema, temperature = 0.
       return text.trim();
     } catch (error) {
       if (error && error.permanent) throw error;
+      // timeout → נחשב כשגיאה ניתנת-לחזרה (לא תקיעה אינסופית)
+      if (error && error.name === 'AbortError') error = new Error('פסק זמן לבקשה (timeout).');
       lastError = error;
       if (i < baseDelays.length) {
         const base = (error && error.waitMs) ? error.waitMs : baseDelays[i];
         const jittered = Math.min(60000, Math.round(base * (0.75 + Math.random() * 0.5))); // jitter
         await delay(jittered);
       }
+    } finally {
+      clearTimeout(timer);
     }
   }
   throw new Error("החיבור לשרת נכשל לאחר מספר ניסיונות. שגיאה אחרונה: " + (lastError?.message || ''));
-};
-
-const parseJsonLoose = (text) => {
-  let t = text.trim();
-  t = t.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
-  try { return JSON.parse(t); } catch (e) {
-    const start = t.indexOf('{');
-    const startA = t.indexOf('[');
-    const s = (startA !== -1 && (startA < start || start === -1)) ? startA : start;
-    const endObj = t.lastIndexOf('}');
-    const endArr = t.lastIndexOf(']');
-    const e2 = Math.max(endObj, endArr);
-    if (s !== -1 && e2 !== -1) {
-      try { return JSON.parse(t.slice(s, e2 + 1)); } catch (_) {}
-    }
-    throw new Error("כשל בפענוח JSON מהמודל.");
-  }
 };
 
 /* ============================== OCR Prompt Builders ============================== */
@@ -725,7 +714,9 @@ const isRashiType = (t) => t === 'rashi' || t === 'rashi_and_print';
 
 const buildOcrSystem = (scriptType, documentType) => {
   let sys = SYSTEM_BASE(docHintFor(documentType));
-  if (isRashiType(scriptType) || scriptType === 'handwriting') sys += '\n' + RASHI_RULES;
+  if (isRashiType(scriptType) || scriptType === 'handwriting') {
+    sys += '\n' + RASHI_RULES + '\n' + RASHI_READING_GUIDE;
+  }
   if (scriptType === 'rashi_and_print') {
     sys += '\nשים לב: העמוד מכיל גם דפוס רגיל וגם כתב רש"י. פענח כל אזור לפי סוג הכתב שלו, ושמור על ההפרדה ביניהם.';
   }
@@ -775,11 +766,11 @@ const classifyDocument = async (imageB64) => {
 
 /* ============================== OCR Passes ============================== */
 
-// Pass 1 / 2 — קריאה גולמית עצמאית
-const ocrRaw = async (imageB64, scriptType, documentType, variantNote) => {
+// Pass 1 / 2 — קריאה גולמית עצמאית (refImageB64 — טבלת ייחוס אותיות רש"י, אופציונלי)
+const ocrRaw = async (imageB64, scriptType, documentType, variantNote, refImageB64) => {
   const system = buildOcrSystem(scriptType, documentType);
   const userText = `חלץ את כל הטקסט מהתמונה תוך יישום מלא של חוקי היסוד.${variantNote ? '\n' + variantNote : ''}`;
-  return callGemini({ system, userText, imageB64 });
+  return callGemini({ system, userText, imageB64, refImageB64 });
 };
 
 // Pass 3 — השוואה ואיחוד שתי הקריאות
@@ -868,25 +859,25 @@ const ocrFinalVerify = async (imageB64, current, scriptType, documentType) => {
 /* ============================== Pipeline Orchestration ============================== */
 
 // פענוח עמוד שלם — Multi-Pass (7 / 10 מעברים). שומר טקסט חלקי בכשל באמצע.
-const runWholePagePipeline = async (images, scriptType, documentType, settings, onStage) => {
+const runWholePagePipeline = async (images, scriptType, documentType, settings, onStage, refImage) => {
   const N = settings.passCount;
   const passes = [];
   let stage = 0;
   const bump = (label) => { stage++; onStage(stage, N, label); };
   const primary = images.enhanced;
-  const secondary = images.binarized || images.enhanced;
+  const secondary = images.secondary || images.enhanced;
   let cur = '';
   let partialText = '';
 
   try {
     bump('Pass 1 — קריאה גולמית');
-    const t1 = await ocrRaw(primary, scriptType, documentType);
+    const t1 = await ocrRaw(primary, scriptType, documentType, null, refImage);
     passes.push({ name: 'Pass 1 — קריאה גולמית', text: t1 });
     cur = t1; partialText = t1;
     await delay(600);
 
     bump('Pass 2 — קריאה שנייה עצמאית');
-    const t2 = await ocrRaw(secondary, scriptType, documentType, 'קרא את התמונה מאפס באופן עצמאי, ללא הסתמכות על קריאה קודמת.');
+    const t2 = await ocrRaw(secondary, scriptType, documentType, 'קרא את התמונה מאפס באופן עצמאי, ללא הסתמכות על קריאה קודמת.', refImage);
     passes.push({ name: 'Pass 2 — קריאה עצמאית', text: t2 });
     await delay(600);
 
@@ -922,7 +913,7 @@ const runWholePagePipeline = async (images, scriptType, documentType, settings, 
       await delay(600);
 
       bump('Pass 9 — קריאה עצמאית נוספת ואיחוד');
-      const t3 = await ocrRaw(secondary, scriptType, documentType, 'קריאה עצמאית שלישית — התעלם מכל הקריאות הקודמות.');
+      const t3 = await ocrRaw(secondary, scriptType, documentType, 'קריאה עצמאית שלישית — התעלם מכל הקריאות הקודמות.', refImage);
       cur = await ocrReconcile(primary, cur, t3, scriptType, documentType);
       passes.push({ name: 'Pass 9 — איחוד שלישי', text: cur }); partialText = cur;
       await delay(600);
@@ -974,13 +965,13 @@ const analyzeLayout = async (imageB64) => {
   return blocks;
 };
 
-const runRegionPipeline = async (images, scriptType, documentType, settings, onStage) => {
+const runRegionPipeline = async (images, scriptType, documentType, settings, onStage, refImage) => {
   // ניתוח פריסה על התמונה המשופרת
   let blocks = [];
   try { blocks = await analyzeLayout(images.enhanced); } catch (e) { blocks = []; }
   if (!blocks.length) {
     // נפילה רכה — פענוח עמוד שלם
-    return runWholePagePipeline(images, scriptType, documentType, settings, onStage);
+    return runWholePagePipeline(images, scriptType, documentType, settings, onStage, refImage);
   }
 
   // כל בלוק עובר רצף מעברים אמיתי: סטנדרט 4 (raw → אותיות דומות → ר"ת → אימות),
@@ -1006,12 +997,12 @@ const runRegionPipeline = async (images, scriptType, documentType, settings, onS
       const tag = `בלוק ${bi + 1}/${blocks.length}`;
 
       bump(`${tag} (${typeLabel}) — קריאה גולמית`);
-      let cur = await ocrRaw(blockImg, blockScript, documentType);
+      let cur = await ocrRaw(blockImg, blockScript, documentType, null, refImage);
       await delay(400);
 
       if (settings.ultraRashi) {
         bump(`${tag} — קריאה עצמאית`);
-        const cur2 = await ocrRaw(blockImg, blockScript, documentType, 'קרא מחדש את הבלוק באופן עצמאי לחלוטין.');
+        const cur2 = await ocrRaw(blockImg, blockScript, documentType, 'קרא מחדש את הבלוק באופן עצמאי לחלוטין.', refImage);
         await delay(400);
         bump(`${tag} — השוואה ואיחוד`);
         cur = await ocrReconcile(blockImg, cur, cur2, blockScript, documentType);
@@ -1073,14 +1064,20 @@ const runOcrEngine = async (page, settings, onStage, onMeta) => {
   try {
     images = await preprocessImage(page.originalImage, settings);
   } catch (e) {
-    images = { enhanced: page.originalImage, binarized: null };
+    images = { enhanced: page.originalImage, secondary: page.originalImage };
+  }
+
+  // 2b. טבלת ייחוס אותיות רש"י (אם הוגדר פונט וזוהה כתב רש"י) — עוזר למודל למפות צורות אות
+  let refImage = null;
+  if (isRashiType(scriptType) && settings.rashiFontUrl) {
+    try { refImage = await buildRashiReferenceChart(settings.rashiFontUrl); } catch (e) { refImage = null; }
   }
 
   // 3. OCR — לפי אזורים או עמוד שלם
   if (settings.regionOcr) {
-    return runRegionPipeline(images, scriptType, documentType, settings, onStage);
+    return runRegionPipeline(images, scriptType, documentType, settings, onStage, refImage);
   }
-  return runWholePagePipeline(images, scriptType, documentType, settings, onStage);
+  return runWholePagePipeline(images, scriptType, documentType, settings, onStage, refImage);
 };
 
 /* ============================== Export Functions ============================== */
@@ -1445,43 +1442,34 @@ export default function App() {
   const ocrProgressPercentage = totalPages > 0 ? Math.round((processedPages / totalPages) * 100) : 0;
   const hasResults = pages.some(p => p.combinedText);
 
-  // --- רינדור טקסט עם הדגשת מילים בעלות אמינות נמוכה (יישור לפי תוכן, לא לפי מיקום) ---
+  // --- רינדור טקסט עם הדגשת מילים בעלות אמינות נמוכה (יישור לפי תוכן — alignConfidence מ-lib) ---
   const renderTextContent = (text, words) => {
-    const paragraphs = text.split('\n').filter(p => p.trim() !== '');
-    const wlist = Array.isArray(words) ? words : [];
-    const norm = (s) => (s || '').replace(/[^֐-׿0-9A-Za-z]/g, '');
-    const matches = (a, b) => a && b && (a === b || a.startsWith(b) || b.startsWith(a));
-    let wi = 0;
-    // התאמת confidence לטוקן לפי מחרוזת המילה (עם resync קל), במקום מונה פוזיציוני שביר
-    const confFor = (tok) => {
-      const nt = norm(tok);
-      if (!nt || wi >= wlist.length) return null;
-      if (matches(nt, norm(wlist[wi].word))) { const c = wlist[wi].confidence; wi++; return c; }
-      for (let k = 1; k <= 4 && wi + k < wlist.length; k++) {
-        if (matches(nt, norm(wlist[wi + k].word))) { const c = wlist[wi + k].confidence; wi = wi + k + 1; return c; }
+    const toks = alignConfidence(text, words);
+    const paras = [];
+    let cur = [];
+    let key = 0;
+    const flush = () => { if (cur.length) { paras.push(cur); cur = []; } };
+    for (const t of toks) {
+      if (t.isSpace) {
+        if (t.token.indexOf('\n') !== -1) flush();
+        else cur.push(<span key={key++}> </span>);
+        continue;
       }
-      return null; // אין התאמה — לא מקדמים את המצביע (מונע סחיפה)
-    };
+      const tok = t.token;
+      if (tok === PLACEHOLDER || tok.indexOf(PLACEHOLDER) !== -1) {
+        cur.push(<span key={key++} className="bg-rose-100 text-rose-600 rounded px-1 font-bold" title="קטע לא קריא">{tok}</span>);
+      } else if (typeof t.confidence === 'number' && t.confidence < CONFIDENCE_THRESHOLD) {
+        cur.push(<span key={key++} className="bg-amber-100 text-amber-900 rounded px-0.5 border-b-2 border-amber-300" title={`אמינות ${t.confidence} — מומלץ לבדוק`}>{tok}</span>);
+      } else {
+        cur.push(<span key={key++}>{tok}</span>);
+      }
+    }
+    flush();
     return (
       <div className="space-y-6 pb-12">
-        {paragraphs.map((paragraph, pIdx) => {
-          const parts = paragraph.split(/(\s+)/);
-          return (
-            <p key={pIdx} className="text-justify leading-[1.85] text-xl md:text-2xl text-slate-800 font-serif break-words px-2 md:px-4">
-              {parts.map((tok, ti) => {
-                if (/^\s+$/.test(tok) || tok === '') return <span key={ti}>{tok}</span>;
-                if (tok === PLACEHOLDER || tok.indexOf(PLACEHOLDER) !== -1) {
-                  return <span key={ti} className="bg-rose-100 text-rose-600 rounded px-1 font-bold" title="קטע לא קריא">{tok}</span>;
-                }
-                const conf = confFor(tok);
-                const low = (typeof conf === 'number' && conf < CONFIDENCE_THRESHOLD);
-                return low
-                  ? <span key={ti} className="bg-amber-100 text-amber-900 rounded px-0.5 border-b-2 border-amber-300" title={`אמינות ${conf} — מומלץ לבדוק`}>{tok}</span>
-                  : <span key={ti}>{tok}</span>;
-              })}
-            </p>
-          );
-        })}
+        {paras.map((children, i) => (
+          <p key={i} className="text-justify leading-[1.85] text-xl md:text-2xl text-slate-800 font-serif break-words px-2 md:px-4">{children}</p>
+        ))}
       </div>
     );
   };
@@ -1817,6 +1805,21 @@ export default function App() {
                 <ToggleRow icon={<LayersIcon className="w-5 h-5 text-indigo-500" />} title="OCR לפי אזורים" desc={'פירוק העמוד לבלוקים (כותרת, גוף, רש"י, שוליים) ופענוח כל בלוק בנפרד. מומלץ לעמודים מורכבים.'} checked={settings.regionOcr} onChange={() => setSettings(s => ({ ...s, regionOcr: !s.regionOcr }))} />
               </div>
 
+              {/* Rashi reference font */}
+              <div className="space-y-2">
+                <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">פונט ייחוס לכתב רש"י (מתקדם)</h4>
+                <input
+                  value={settings.rashiFontUrl || ''}
+                  onChange={e => setSettings(s => ({ ...s, rashiFontUrl: e.target.value }))}
+                  dir="ltr"
+                  placeholder="/rashi.ttf"
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 font-mono text-sm text-slate-700 focus:outline-none focus:border-indigo-400"
+                />
+                <p className="text-[11px] text-slate-500 font-medium leading-snug">
+                  אופציונלי: כשמזוהה כתב רש"י, נבנית טבלת ייחוס של אותיות רש"י מול דפוס ונשלחת למודל לשיפור זיהוי צורות האות. כדי להפעיל — הניחו קובץ פונט רש"י בשם <code className="bg-slate-100 px-1 rounded">public/rashi.ttf</code> (או ציינו URL). אם הקובץ חסר — הפיצ'ר מושבת בשקט. (זהו <b>ייחוס בהקשר</b>, לא אימון מודל.)
+                </p>
+              </div>
+
               {/* Script type */}
               <div className="space-y-2">
                 <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">סוג כתב</h4>
@@ -1849,16 +1852,16 @@ export default function App() {
               <div className="space-y-3">
                 <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">עיבוד מקדים (Preprocessing)</h4>
                 {[
-                  ['superResolution', 'Super Resolution', 'הגדלת רזולוציה וחידוד תמונה'],
-                  ['deskew', 'Deskew', 'יישור דפים עקומים'],
-                  ['contrast', 'Contrast Enhancement', 'שיפור ניגודיות'],
-                  ['sharpen', 'Sharpen', 'חידוד טקסט'],
-                  ['denoise', 'Denoise', 'ניקוי רעשים (איטי יותר)'],
-                  ['adaptiveThreshold', 'Adaptive Threshold', 'הבלטת אותיות חלשות (קריאה עצמאית נוספת)'],
-                ].map(([key, title, desc]) => (
-                  <ToggleRow key={key} small title={title} desc={desc} checked={settings.preprocess[key]} disabled={settings.ultraRashi} onChange={() => setSettings(s => ({ ...s, preprocess: { ...s.preprocess, [key]: !s.preprocess[key] } }))} />
+                  ['superResolution', 'Super Resolution', 'הגדלת רזולוציה', true],
+                  ['deskew', 'Deskew', 'יישור דפים עקומים', true],
+                  ['contrast', 'Contrast Enhancement', 'שיפור ניגודיות מתון', true],
+                  ['sharpen', 'Sharpen', 'חידוד עדין', true],
+                  ['denoise', 'Denoise', 'ניקוי רעשים (איטי; עלול לפגוע באותיות דקות)', false],
+                  ['adaptiveThreshold', 'Adaptive Threshold', 'בינריזציה (עלולה לפגוע בכתב רש"י)', false],
+                ].map(([key, title, desc, forcedInUltra]) => (
+                  <ToggleRow key={key} small title={title} desc={desc} checked={settings.preprocess[key] || (settings.ultraRashi && forcedInUltra)} disabled={settings.ultraRashi && forcedInUltra} onChange={() => setSettings(s => ({ ...s, preprocess: { ...s.preprocess, [key]: !s.preprocess[key] } }))} />
                 ))}
-                {settings.ultraRashi && <p className="text-[11px] text-amber-600 font-bold">במצב Ultra Rashi כל שלבי העיבוד פעילים.</p>}
+                {settings.ultraRashi && <p className="text-[11px] text-amber-600 font-bold">במצב Ultra Rashi מופעלים אוטומטית: Super-Resolution, חידוד, ניגודיות ויישור (Denoise/Threshold נשארים אופציונליים כי הם עלולים לפגוע בכתב רש"י).</p>}
               </div>
 
               <button onClick={() => setSettings(DEFAULT_SETTINGS)} className="w-full py-3 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold text-sm transition-colors">איפוס להגדרות ברירת מחדל</button>
