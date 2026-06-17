@@ -40,7 +40,24 @@ const LayersIcon = ({ className }) => (<svg xmlns="http://www.w3.org/2000/svg" v
 
 /* ============================== Engine Configuration ============================== */
 
-const GEMINI_MODEL = 'gemini-2.5-flash-preview-09-2025';
+// מודל ברירת מחדל — מודל יציב (GA). מודלי preview עם סיומת תאריך עלולים להחזיר 404.
+const DEFAULT_MODEL = 'gemini-2.5-flash';
+const MODEL_STORE = 'nexusocr_model';
+// רשימת מודלים נפוצים לבחירה מהירה (ניתן גם להזין ידנית או לשלוף מהמפתח)
+const MODEL_OPTIONS = [
+  'gemini-2.5-flash',
+  'gemini-2.5-pro',
+  'gemini-2.5-flash-lite',
+  'gemini-2.0-flash',
+  'gemini-2.0-flash-lite',
+  'gemini-1.5-flash',
+  'gemini-1.5-pro'
+];
+const getModel = () => {
+  try { const m = localStorage.getItem(MODEL_STORE); if (m && m.trim()) return m.trim(); } catch (e) {}
+  return DEFAULT_MODEL;
+};
+
 // מפתח Gemini API: עדיפות למפתח שהוזן בממשק (localStorage), ואז למשתנה הסביבה
 // VITE_GEMINI_API_KEY (מוגדר בפריסה, למשל ב-Vercel). נטען בזמן ריצה כדי לאפשר הזנה.
 const ENV_API_KEY = (() => {
@@ -51,7 +68,8 @@ const getApiKey = () => {
   try { const k = localStorage.getItem(API_KEY_STORE); if (k && k.trim()) return k.trim(); } catch (e) {}
   return ENV_API_KEY;
 };
-const apiUrl = () => `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${getApiKey()}`;
+const apiUrl = () => `https://generativelanguage.googleapis.com/v1beta/models/${getModel()}:generateContent?key=${getApiKey()}`;
+const listModelsUrl = () => `https://generativelanguage.googleapis.com/v1beta/models?key=${getApiKey()}&pageSize=200`;
 
 // סף אמינות — מתחת לכך המילה מסומנת לבדיקה
 const CONFIDENCE_THRESHOLD = 85;
@@ -1245,12 +1263,43 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const [apiKey, setApiKeyState] = useState('');
+  const [model, setModelState] = useState(DEFAULT_MODEL);
+  const [availableModels, setAvailableModels] = useState([]);
+  const [modelLoading, setModelLoading] = useState(false);
 
   const wakeLockRef = useRef(null);
 
   const updateApiKey = (v) => {
     setApiKeyState(v);
     try { localStorage.setItem(API_KEY_STORE, v); } catch (e) {}
+  };
+  const updateModel = (v) => {
+    setModelState(v);
+    try { localStorage.setItem(MODEL_STORE, v); } catch (e) {}
+  };
+
+  // שליפת רשימת המודלים שהמפתח תומך בהם (ListModels) — פותר שגיאות 404 של מודל
+  const fetchAvailableModels = async () => {
+    if (!getApiKey()) { setGlobalError('יש להזין מפתח Gemini API לפני שליפת רשימת המודלים.'); return; }
+    setModelLoading(true);
+    try {
+      const r = await fetch(listModelsUrl());
+      const j = await r.json();
+      if (!r.ok) throw new Error(j?.error?.message || ('שגיאה ' + r.status));
+      const list = (j.models || [])
+        .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+        .map(m => (m.name || '').replace('models/', ''))
+        .filter(n => n && n.toLowerCase().includes('gemini'));
+      if (!list.length) throw new Error('לא נמצאו מודלים נתמכים למפתח זה.');
+      setAvailableModels(list);
+      // אם המודל הנוכחי אינו ברשימה — עבור אוטומטית למודל הנתמך הראשון
+      if (!list.includes(getModel())) updateModel(list[0]);
+      setGlobalError(null);
+    } catch (e) {
+      setGlobalError('שגיאה בשליפת רשימת המודלים: ' + (e.message || ''));
+    } finally {
+      setModelLoading(false);
+    }
   };
 
   // טעינה/שמירה של הגדרות ב-localStorage
@@ -1260,6 +1309,8 @@ export default function App() {
       if (saved) setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(saved) });
       const savedKey = localStorage.getItem(API_KEY_STORE);
       if (savedKey) setApiKeyState(savedKey);
+      const savedModel = localStorage.getItem(MODEL_STORE);
+      if (savedModel) setModelState(savedModel);
     } catch (e) {}
   }, []);
   useEffect(() => {
@@ -1727,6 +1778,35 @@ export default function App() {
                 />
                 <p className="text-[11px] text-slate-500 font-medium leading-snug">
                   המפתח נשמר מקומית בדפדפן בלבד ואינו נשלח לשום מקום מלבד Google. לחלופין ניתן להגדיר את משתנה הסביבה <code className="bg-slate-100 px-1 rounded">VITE_GEMINI_API_KEY</code> בפריסה (Vercel). השג מפתח חינמי ב-Google AI Studio.
+                </p>
+              </div>
+
+              {/* Model */}
+              <div className="space-y-2">
+                <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">מודל Gemini</h4>
+                <div className="flex gap-2">
+                  <input
+                    value={model}
+                    onChange={e => updateModel(e.target.value)}
+                    dir="ltr"
+                    placeholder="gemini-2.5-flash"
+                    className="flex-1 bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 font-mono text-sm text-slate-700 focus:outline-none focus:border-indigo-400"
+                  />
+                  <button onClick={fetchAvailableModels} disabled={modelLoading}
+                    className="shrink-0 px-4 py-3 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold text-sm border border-indigo-100 disabled:opacity-50 whitespace-nowrap">
+                    {modelLoading ? 'טוען...' : 'רענן רשימה'}
+                  </button>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {[...new Set([...MODEL_OPTIONS, ...availableModels])].map(m => (
+                    <button key={m} onClick={() => updateModel(m)}
+                      className={`text-[11px] font-bold px-2.5 py-1 rounded-full border transition-colors ${model === m ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-600 border-slate-200 hover:border-indigo-300'}`}>
+                      {m}{availableModels.includes(m) ? ' ✓' : ''}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[11px] text-slate-500 font-medium leading-snug">
+                  בשגיאת 404 — המודל אינו זמין למפתח שלך. לחץ <b>"רענן רשימה"</b> כדי לראות את המודלים שהמפתח תומך בהם (מסומנים ב-✓) ובחר אחד. ברירת המחדל: <code className="bg-slate-100 px-1 rounded">gemini-2.5-flash</code>. לדיוק מרבי נסה <code className="bg-slate-100 px-1 rounded">gemini-2.5-pro</code>.
                 </p>
               </div>
 
