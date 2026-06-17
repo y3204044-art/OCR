@@ -80,13 +80,44 @@
 
 ---
 
-## 🚀 הפעלה
-זוהי קומפוננטת React יחידה (`nexus_ocr (3).tsx`) הטוענת את תלויותיה (`pdf.js`, `docx`) מ-CDN בזמן ריצה.
-ניתן לשבץ אותה בכל סביבת React, או להריץ בסביבה התומכת בהזרקת מפתח Gemini (`API_KEY`).
+## 🛠️ מבנה הפרויקט
+פרויקט **Vite + React + TypeScript + Tailwind CSS** מוכן לפריסה:
 
-**שימוש:**
+```
+├─ index.html              # נקודת כניסה ל-Vite
+├─ package.json            # תלויות וסקריפטים
+├─ vite.config.ts          # תצורת Vite
+├─ tailwind.config.js      # תצורת Tailwind
+├─ postcss.config.js
+├─ tsconfig.json
+├─ vercel.json             # תצורת פריסה ל-Vercel
+└─ src/
+   ├─ main.tsx             # bootstrap של React
+   ├─ App.tsx              # מנוע ה-OCR והממשק (הקובץ המרכזי)
+   ├─ index.css            # Tailwind
+   └─ vite-env.d.ts
+```
+
+> התלויות הכבדות (`pdf.js`, `docx`) נטענות מ-CDN בזמן ריצה — אין צורך להתקין אותן.
+
+## 🚀 הרצה מקומית
+```bash
+npm install
+npm run dev      # שרת פיתוח (http://localhost:5173)
+npm run build    # בנייה לפרודקשן → dist/
+npm run preview  # תצוגה מקדימה של ה-build
+```
+
+## ☁️ פריסה ל-Vercel
+1. חברו את המאגר ל-Vercel — הוא יזהה אוטומטית את framework **Vite** (build: `npm run build`, output: `dist`).
+2. הגדירו משתנה סביבה **`VITE_GEMINI_API_KEY`** עם מפתח Gemini (Settings → Environment Variables), או הזינו מפתח ישירות בממשק (⚙️ הגדרות) — הוא נשמר מקומית בדפדפן.
+3. Deploy.
+
+> **חשוב:** ללא מפתח Gemini תקין הסריקה לא תפעל. השיגו מפתח חינמי ב-[Google AI Studio](https://aistudio.google.com/apikey).
+
+## 📖 שימוש
 1. לחצו "הוסף קבצים" (תמונות JPG/PNG או PDF).
-2. (אופציונלי) פתחו ⚙️ הגדרות לבחירת מצב Ultra Rashi / OCR לפי אזורים / סוג כתב / רזולוציה / שלבי עיבוד.
+2. (אופציונלי) פתחו ⚙️ הגדרות לבחירת מצב Ultra Rashi / OCR לפי אזורים / סוג כתב / רזולוציה / שלבי עיבוד, והזנת מפתח API.
 3. לחצו "התחל סריקה רב-שלבית".
 4. ייצאו לפורמט הרצוי דרך תפריט "ייצוא".
 

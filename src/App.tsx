@@ -41,9 +41,17 @@ const LayersIcon = ({ className }) => (<svg xmlns="http://www.w3.org/2000/svg" v
 /* ============================== Engine Configuration ============================== */
 
 const GEMINI_MODEL = 'gemini-2.5-flash-preview-09-2025';
-// מפתח מוזרק ע"י סביבת ההרצה (כמו בגרסה המקורית). ניתן להחליף במפתח אישי בעת הצורך.
-const API_KEY = "";
-const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${API_KEY}`;
+// מפתח Gemini API: עדיפות למפתח שהוזן בממשק (localStorage), ואז למשתנה הסביבה
+// VITE_GEMINI_API_KEY (מוגדר בפריסה, למשל ב-Vercel). נטען בזמן ריצה כדי לאפשר הזנה.
+const ENV_API_KEY = (() => {
+  try { return (import.meta && import.meta.env && import.meta.env.VITE_GEMINI_API_KEY) || ""; } catch (e) { return ""; }
+})();
+const API_KEY_STORE = 'nexusocr_api_key';
+const getApiKey = () => {
+  try { const k = localStorage.getItem(API_KEY_STORE); if (k && k.trim()) return k.trim(); } catch (e) {}
+  return ENV_API_KEY;
+};
+const apiUrl = () => `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${getApiKey()}`;
 
 // סף אמינות — מתחת לכך המילה מסומנת לבדיקה
 const CONFIDENCE_THRESHOLD = 85;
@@ -586,12 +594,16 @@ const callGemini = async ({ system, userText, imageB64, schema, temperature = 0.
     contents: [{ role: "user", parts }]
   };
 
+  if (!getApiKey()) {
+    throw Object.assign(new Error('לא הוגדר מפתח Gemini API. הזן מפתח בהגדרות (⚙️) או הגדר VITE_GEMINI_API_KEY בפריסה.'), { permanent: true });
+  }
+
   const baseDelays = [1500, 3000, 6000, 12000];
   let lastError = null;
   for (let i = 0; i <= baseDelays.length; i++) {
     try {
       await rateLimitGate();
-      const response = await fetch(API_URL, {
+      const response = await fetch(apiUrl(), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
@@ -1232,14 +1244,22 @@ export default function App() {
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const [apiKey, setApiKeyState] = useState('');
 
   const wakeLockRef = useRef(null);
+
+  const updateApiKey = (v) => {
+    setApiKeyState(v);
+    try { localStorage.setItem(API_KEY_STORE, v); } catch (e) {}
+  };
 
   // טעינה/שמירה של הגדרות ב-localStorage
   useEffect(() => {
     try {
       const saved = localStorage.getItem('nexusocr_settings');
       if (saved) setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(saved) });
+      const savedKey = localStorage.getItem(API_KEY_STORE);
+      if (savedKey) setApiKeyState(savedKey);
     } catch (e) {}
   }, []);
   useEffect(() => {
@@ -1416,6 +1436,7 @@ export default function App() {
   };
 
   const eff = effectiveSettings(settings);
+  const keyMissing = !(apiKey && apiKey.trim()) && !ENV_API_KEY;
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 font-sans selection:bg-indigo-200 selection:text-indigo-900 flex flex-col overflow-hidden" dir="rtl">
@@ -1575,6 +1596,13 @@ export default function App() {
 
         {/* Workspace Panels */}
         <main className="flex-1 flex flex-col p-4 md:p-6 overflow-hidden h-full">
+          {keyMissing && (
+            <div className="mb-4 p-4 bg-amber-50 border border-amber-200 rounded-2xl text-amber-800 text-sm flex items-center gap-3 shadow-md shrink-0">
+              <AlertCircleIcon className="w-6 h-6 shrink-0 text-amber-500" />
+              <span className="font-bold font-sans flex-1">לא הוגדר מפתח Gemini API — הסריקה לא תפעל. הזן מפתח כדי להתחיל.</span>
+              <button onClick={() => setSettingsOpen(true)} className="bg-amber-500 hover:bg-amber-600 text-white px-4 py-1.5 rounded-lg transition-colors font-extrabold whitespace-nowrap">הזן מפתח ⚙️</button>
+            </div>
+          )}
           {globalError && (
             <div className="mb-4 p-4 bg-rose-50 border border-rose-200 rounded-2xl text-rose-700 text-sm flex items-center gap-3 shadow-md shrink-0">
               <AlertCircleIcon className="w-6 h-6 shrink-0" />
@@ -1686,6 +1714,22 @@ export default function App() {
             </div>
 
             <div className="p-7 space-y-6">
+              {/* API Key */}
+              <div className="space-y-2">
+                <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">מפתח Gemini API</h4>
+                <input
+                  type="password"
+                  value={apiKey}
+                  onChange={e => updateApiKey(e.target.value)}
+                  placeholder="הדבק כאן מפתח Gemini API"
+                  dir="ltr"
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 font-mono text-sm text-slate-700 focus:outline-none focus:border-indigo-400"
+                />
+                <p className="text-[11px] text-slate-500 font-medium leading-snug">
+                  המפתח נשמר מקומית בדפדפן בלבד ואינו נשלח לשום מקום מלבד Google. לחלופין ניתן להגדיר את משתנה הסביבה <code className="bg-slate-100 px-1 rounded">VITE_GEMINI_API_KEY</code> בפריסה (Vercel). השג מפתח חינמי ב-Google AI Studio.
+                </p>
+              </div>
+
               {/* Modes */}
               <div className="space-y-3">
                 <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">מצבי פענוח</h4>
